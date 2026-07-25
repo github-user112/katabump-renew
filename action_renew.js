@@ -2206,8 +2206,15 @@ async function runMain() {
             }
         } catch (err) {
             console.error(`Error processing user:`, err);
-            runStatus = 'error';
-            blockMessage = err.message;
+            // 代理网络错误（ERR_TUNNEL_CONNECTION_FAILED 等）→ PROXY_RETRY 让外层换代理
+            const isProxyNetworkError = /ERR_TUNNEL_CONNECTION_FAILED|ECONNRESET|ETIMEDOUT|ECONNREFUSED|ERR_CONNECTION_REFUSED|ERR_CONNECTION_RESET|ERR_NETWORK_CHANGED|ERR_NAME_NOT_RESOLVED/.test(err.message || err.code || '');
+            if (isProxyNetworkError) {
+                runStatus = 'login_captcha_required';  // 映射到 PROXY_RETRY=42
+                blockMessage = `代理网络错误: ${err.message}`;
+            } else {
+                runStatus = 'error';
+                blockMessage = err.message;
+            }
         } finally {
             const cleanupResult = await finalizeAccountResources({
                 page,
