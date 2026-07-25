@@ -92,7 +92,7 @@ process.env.NO_PROXY = 'localhost,127.0.0.1';
 
 const HTTP_PROXY = process.env.HTTP_PROXY;
 const TARGET_LOGIN_URL = 'https://dashboard.katabump.com/auth/login';
-const CHROME_BOOT_TIMEOUT_MS = 20_000;
+const CHROME_BOOT_TIMEOUT_MS = 60_000;
 const CDP_CONNECT_ATTEMPTS = 5;
 const CDP_CONNECT_DELAY_MS = 2_000;
 let PROXY_CONFIG = null;
