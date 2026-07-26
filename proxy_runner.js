@@ -100,47 +100,88 @@ function buildFinalSummary(finalCode, finalResult, attempts) {
     if (finalCode === EXIT_CODE.FATAL && attempts.length > 0 && attempts.every(item => item.code === EXIT_CODE.PROXY_RETRY)) {
         status = 'proxy_exhausted';
     }
-    let message = actionResult.message || '';
-    if (!message) {
-        message = status === 'proxy_exhausted' ? 'All proxy attempts returned PROXY_RETRY' : '';
+
+    const accounts = Array.isArray(actionResult.accounts) ? actionResult.accounts : [];
+    const counts = {
+        success: accounts.filter(account => ['success', 'already_renewed'].includes(account.status)).length,
+        notReady: accounts.filter(account => account.status === 'not_ready').length,
+        failed: accounts.filter(account => !['success', 'not_ready', 'already_renewed'].includes(account.status)).length
+    };
+    if (counts.success === 0 && counts.notReady === 0 && counts.failed === 0 && accounts.length === 0) {
+        counts.failed = 0;
     }
-    return { status, message, attempts };
+
+    return {
+        exitCode: finalCode,
+        status,
+        message: actionResult.message || '',
+        screenshotPath: actionResult.screenshotPath || (lastAttempt && lastAttempt.screenshotPath) || null,
+        htmlPath: actionResult.htmlPath || (lastAttempt && lastAttempt.htmlPath) || null,
+        attempts,
+        accounts,
+        counts
+    };
 }
 
-function formatFinalNotification(finalCode, finalResult, attempts) {
-    const summary = buildFinalSummary(finalCode, finalResult, attempts);
-    const lines = [];
-    lines.push(`[Katabump Renew] ${summary.status}`);
-    lines.push('');
-    for (const item of attempts) {
-        const time = new Date().toISOString();
-        lines.push(`[${item.attempt}] proxy=${item.proxy} code=${item.code} status=${item.status} ${item.message || ''}`);
+function formatFinalNotification(summary) {
+    const titles = {
+        success: '✅ KataBump 自动续期完成',
+        not_ready: '⏳ KataBump 本轮暂不可续期',
+        already_renewed: 'ℹ️ KataBump 已续期或无需重复续期',
+        captcha_required: '⚠️ KataBump 续期验证码阻断',
+        login_failed: '❌ KataBump 登录失败',
+        no_proxy_available: '❌ KataBump 无可用代理',
+        proxy_exhausted: '❌ KataBump 代理已耗尽',
+        proxy_retry: '❌ KataBump 代理重试失败',
+        error: '❌ KataBump 自动续期失败'
+    };
+    const lines = [
+        titles[summary.status] || titles.error,
+        '',
+        `代理尝试：${summary.attempts.length}/${CONFIG.MAX_PROXY_SWITCHES}`
+    ];
+    if (summary.accounts.length > 0) {
+        lines.push(`账号总数：${summary.accounts.length}`);
+        lines.push(`成功：${summary.counts.success}`);
+        lines.push(`暂不可续期：${summary.counts.notReady}`);
+        lines.push(`失败：${summary.counts.failed}`);
     }
-    lines.push('');
-    lines.push(`Final: ${summary.status} — ${summary.message}`);
+    lines.push(`最终状态：${summary.status}`);
+    if (summary.message) lines.push(`原因：${summary.message}`);
     return lines.join('\n');
+}
+
+async function sendFinalTelegram(summary) {
+    const message = formatFinalNotification(summary);
+    console.log('[proxy-runner] 发送最终 Telegram 通知');
+    try {
+        const result = await sendTelegramNotification({
+            axios,
+            FormData,
+            fs,
+            token: TG_BOT_TOKEN,
+            chatId: TG_CHAT_ID,
+            message,
+            imagePath: summary.screenshotPath,
+            logger: console
+        });
+        if (result.skipped) console.log('[proxy-runner] Telegram 未配置，跳过最终通知');
+        return result;
+    } catch (error) {
+        console.error('[proxy-runner] 最终 Telegram 通知失败:', error.message);
+        return { skipped: false, textSent: false, imageSent: false };
+    }
+}
+
+async function finalizeWorkflow(finalCode, finalResult, attempts) {
+    const summary = buildFinalSummary(finalCode, finalResult, attempts);
+    await sendFinalTelegram(summary);
+    return finalCode;
 }
 
 // ============================================================
 //  冷却管理
 // ============================================================
-function proxyKey(parsed) {
-    const ip = parsed.ip || parsed.host || '';
-    return `${ip}:${parsed.port}`;
-}
-
-function safeProxyId(parsed) {
-    if (!parsed || !parsed.valid) return 'invalid';
-    if (parsed.ip) return `${parsed.ip}:${parsed.port}`;
-    if (parsed.host) return `${parsed.ip || parsed.host}:${parsed.port}`;
-    return 'unknown';
-    if (!parsed) return 'direct';
-    const host = parsed.host || '';
-    const port = parsed.port || '';
-    const masked = host.split('.').map((seg, i) => i === 0 || i === 3 ? seg : '***');
-    return `${masked.join('.')}:${port}`;
-}
-
 function loadCooldowns() {
     try {
         if (!fs.existsSync(CONFIG.COOLDOWN_FILE)) return {};
@@ -193,7 +234,7 @@ function parseProxyLine(line, lineNumber) {
     const isValidHost = (s) => (
         typeof s === 'string' &&
         s.length > 0 &&
-        !/[\\s/\\\\?#@\u0000-\u001f\u007f]/.test(s)
+        !/[\s/\\?#@\u0000-\u001f\u007f]/.test(s)
     );
 
     // Format 1: http://USER:PASSWORD@HOST:PORT
@@ -208,102 +249,115 @@ function parseProxyLine(line, lineNumber) {
         // URL format is exactly http://USERNAME:PASSWORD@HOST:PORT.
         // URL accepts paths, queries, and fragments, but none are part of the
         // frozen proxy input format. A trailing extra host field is rejected by
-        // Node.js URL parser, so we only accept URL with port and no path/query/fragment.
-        // If the URL has a path, query, or fragment, or does not have a port, reject.
-        if (!parsedUrl.port || parsedUrl.pathname !== '/' || parsedUrl.search || parsedUrl.hash) {
+        // URL itself as an invalid port.
+        const explicitPortMatch = trimmed.match(/:(\d+)\/?$/);
+        const port = (explicitPortMatch && explicitPortMatch[1]) || parsedUrl.port;
+
+        if (
+            parsedUrl.protocol !== 'http:' ||
+            !parsedUrl.hostname ||
+            !port ||
+            parsedUrl.pathname !== '/' ||
+            parsedUrl.search ||
+            parsedUrl.hash ||
+            !parsedUrl.username ||
+            !parsedUrl.password
+        ) {
             return { valid: false, reason: 'invalid_url_format', lineNumber };
         }
 
-        const host = parsedUrl.hostname;
-        if (!isValidHost(host)) {
-            return { valid: false, reason: 'invalid_host', lineNumber };
+        let username;
+        let password;
+        try {
+            username = decodeURIComponent(parsedUrl.username);
+            password = decodeURIComponent(parsedUrl.password);
+        } catch {
+            return { valid: false, reason: 'invalid_url_encoding', lineNumber };
         }
 
-        const port = parsedUrl.port;
-        if (!isValidPort(port)) {
-            return { valid: false, reason: 'invalid_port', lineNumber };
-        }
-
-        const username = parsedUrl.username ? decodeURIComponent(parsedUrl.username) : '';
-        const password = parsedUrl.password ? decodeURIComponent(parsedUrl.password) : '';
-
-        // Auth is required for Webshare-style proxies
         if (!username || !password) {
-            return { valid: false, reason: 'missing_auth_for_webshare', lineNumber };
+            return { valid: false, reason: 'invalid_credentials', lineNumber };
         }
-
-        return {
-            valid: true,
-            protocol: 'http',
-            ip: host,
-            port,
-            username,
-            password,
-            lineNumber
-        };
+        if (!isValidHost(parsedUrl.hostname) || !isValidPort(port)) {
+            return { valid: false, reason: 'invalid_url_format', lineNumber };
+        }
+        return { valid: true, ip: parsedUrl.hostname, port, username, password, lineNumber };
     }
 
-    // Format 2: IP:PORT:USER:PASS
-    const parts = trimmed.split(':');
-    if (parts.length === 4) {
-        const [host, port, username, password] = parts;
-        if (!isValidHost(host)) return { valid: false, reason: 'invalid_host', lineNumber };
-        if (!isValidPort(port)) return { valid: false, reason: 'invalid_port', lineNumber };
-        if (!username) return { valid: false, reason: 'missing_username', lineNumber };
-        if (!password) return { valid: false, reason: 'missing_password', lineNumber };
-        return { valid: true, protocol: 'http', ip: host, port, username, password, lineNumber };
+    // Format 2: HOST:PORT or HOST:PORT:USER:PASSWORD (Webshare standard)
+    const colonParts = trimmed.split(':');
+
+    if (colonParts.length === 2) {
+        const ip = colonParts[0];
+        const port = colonParts[1];
+        if (!ip) return { valid: false, reason: 'empty_ip', lineNumber };
+        if (!isValidHost(ip)) return { valid: false, reason: 'invalid_host', lineNumber };
+        if (!port) return { valid: false, reason: 'empty_port', lineNumber };
+        if (!isValidPort(port)) return { valid: false, reason: `invalid_port:${port}`, lineNumber };
+        return { valid: true, ip: ip.toLowerCase(), port, username: '', password: '', lineNumber };
     }
 
-    // Format 3: IP:PORT (no auth)
-    if (parts.length === 2) {
-        const [host, port] = parts;
-        if (!isValidHost(host)) return { valid: false, reason: 'invalid_host', lineNumber };
-        if (!isValidPort(port)) return { valid: false, reason: 'invalid_port', lineNumber };
-        return { valid: true, protocol: 'http', ip: host, port, username: '', password: '', lineNumber };
+    if (colonParts.length >= 4) {
+        const ip = colonParts[0];
+        const port = colonParts[1];
+        const username = colonParts[2] || '';
+        const password = colonParts.slice(3).join(':') || '';
+        if (!ip) return { valid: false, reason: 'empty_ip', lineNumber };
+        if (!isValidHost(ip)) return { valid: false, reason: 'invalid_host', lineNumber };
+        if (!port) return { valid: false, reason: 'empty_port', lineNumber };
+        if (!isValidPort(port)) return { valid: false, reason: `invalid_port:${port}`, lineNumber };
+        if (!username || !password) return { valid: false, reason: 'invalid_credentials', lineNumber };
+        return { valid: true, ip: ip.toLowerCase(), port, username, password, lineNumber };
     }
 
-    return { valid: false, reason: 'unsupported_format', lineNumber };
+    return { valid: false, reason: `invalid_field_count:${colonParts.length}`, lineNumber };
 }
 
 function buildHttpProxy(parsed) {
-    if (!parsed || !parsed.valid) return null;
-    const ip = parsed.ip || parsed.host || '';
-    const port = parsed.port || '';
-    const protocol = parsed.protocol || 'http';
-    const { username, password } = parsed;
-    if (!ip || !port) return null;
-    if (username && password) {
-        return `${protocol}://${encodeURIComponent(username)}:${encodeURIComponent(password)}@${ip}:${port}`;
-    }
-    return `${protocol}://${ip}:${port}`;
-}
-
-function maskProxyUrl(url) {
-    if (!url) return 'null';
+    if (!parsed || !parsed.valid || !parsed.ip || !parsed.port) return null;
+    if ((parsed.username && !parsed.password) || (!parsed.username && parsed.password)) return null;
+    if (/[\s/\\?#@\u0000-\u001f\u007f]/.test(parsed.ip)) return null;
+    const encodedUser = parsed.username ? encodeURIComponent(parsed.username) : '';
+    const encodedPass = parsed.password ? encodeURIComponent(parsed.password) : '';
+    const auth = [encodedUser, encodedPass].filter(Boolean).join(':');
+    const urlStr = auth
+        ? `http://${auth}@${parsed.ip}:${parsed.port}`
+        : `http://${parsed.ip}:${parsed.port}`;
     try {
-        const u = new URL(url);
-        if (u.username) u.username = '***';
-        if (u.password) u.password = '***';
-        return u.toString();
-    } catch {
-        return '(invalid)';
-    }
-}
-
-function emitGithubMask(parsed) {
-    if (!parsed || !parsed.valid) return;
-    const key = proxyKey(parsed);
-    if (process.env.GITHUB_ACTIONS === 'true' && process.env.GITHUB_ENV) {
+        const u = new URL(urlStr);
+        let decodedUser = '';
+        let decodedPass = '';
         try {
-            fs.appendFileSync(process.env.GITHUB_ENV, `MASKED_PROXY_KEY=${key}\n`);
-        } catch (e) {
-            // ignore
+            decodedUser = u.username ? decodeURIComponent(u.username) : '';
+            decodedPass = u.password ? decodeURIComponent(u.password) : '';
+        } catch {
+            return null;
         }
+        const effectivePort = u.port || (u.protocol === 'http:' ? '80' : '');
+        if (
+            u.protocol !== 'http:' ||
+            u.hostname !== parsed.ip ||
+            effectivePort !== String(parsed.port) ||
+            Boolean(u.username) !== Boolean(parsed.username) ||
+            Boolean(u.password) !== Boolean(parsed.password) ||
+            decodedUser !== (parsed.username || '') ||
+            decodedPass !== (parsed.password || '') ||
+            u.pathname !== '/' && u.pathname !== ''
+        ) {
+            return null;
+        }
+    } catch {
+        return null;
     }
+    return urlStr;
 }
 
-function buildChildEnv(parsed, parentEnv) {
-    const env = { ...parentEnv };
+function proxyKey(parsed) {
+    return `${parsed.ip}:${parsed.port}`;
+}
+
+function buildChildEnv(parsed, baseEnv) {
+    const env = { ...(baseEnv || process.env) };
     if (parsed === null) {
         delete env.HTTP_PROXY;
         delete env.HTTPS_PROXY;
@@ -311,20 +365,43 @@ function buildChildEnv(parsed, parentEnv) {
         delete env.https_proxy;
         return env;
     }
-    if (!parsed || !parsed.valid) return null;
     const proxyUrl = buildHttpProxy(parsed);
-    if (!proxyUrl) return null;
+    if (!proxyUrl) {
+        return null;
+    }
     env.HTTP_PROXY = proxyUrl;
     env.HTTPS_PROXY = proxyUrl;
     env.http_proxy = proxyUrl;
     env.https_proxy = proxyUrl;
-    // 传递当前代理标识给子进程，用于截图文件名
-    env.CURRENT_PROXY = proxyKey(parsed);
     return env;
 }
 
+function maskProxyUrl(proxyUrl) {
+    try {
+        const u = new URL(proxyUrl);
+        const port = u.port || (u.protocol === 'http:' ? '80' : '');
+        if (u.username || u.password) {
+            return `${u.protocol}//***:***@${u.hostname}:${port}`;
+        }
+        return proxyUrl;
+    } catch {
+        return '***';
+    }
+}
+
+function emitGithubMask(proxyUrl, env = process.env, logger = console.log) {
+    if (env.GITHUB_ACTIONS === 'true') {
+        logger(`::add-mask::${proxyUrl}`);
+    }
+}
+
+function safeProxyId(parsed) {
+    if (!parsed || !parsed.valid) return 'invalid';
+    return `${parsed.ip}:${parsed.port}`;
+}
+
 // ============================================================
-//  加载代理列表
+//  代理选择
 // ============================================================
 function loadProxies() {
     if (!fs.existsSync(CONFIG.PROXIES_FILE)) {
@@ -394,42 +471,38 @@ async function runActionRenew(parsed, attempt = 1) {
         console.log(`[proxy-runner] 设置 HTTP_PROXY=${safeProxyId(parsed)}`);
         const proxyUrl = buildHttpProxy(parsed);
         console.log(`[proxy-runner] 代理地址: ${maskProxyUrl(proxyUrl)}`);
+        emitGithubMask(proxyUrl);
     }
 
+    const scriptPath = path.join(process.cwd(), 'action_renew.js');
     const resultFile = createAttemptResultFile(attempt);
-    const child = spawn('node', ['action_renew.js', '--result-file', resultFile], {
-        env,
-        stdio: ['inherit', 'inherit', 'inherit'],
-        cwd: process.cwd()
-    });
+    env.KATABUMP_MANAGED_BY_PROXY_RUNNER = '1';
+    env.KATABUMP_RESULT_FILE = resultFile;
+    console.log(`[proxy-runner] 启动 action_renew.js，超时=${ACTION_TIMEOUT_MINUTES} 分钟，SIGTERM 宽限=${Math.round(DEFAULT_GRACEFUL_TERMINATION_MS / 1000)} 秒...`);
 
     try {
-        const childResult = await runChildWithTimeout(child, ACTION_TIMEOUT_MS, DEFAULT_GRACEFUL_TERMINATION_MS);
+        const proc = spawn('node', [scriptPath], {
+            env,
+            stdio: 'inherit',
+            shell: false,
+            detached: true
+        });
+
+        const result = await runChildWithTimeout(proc, {
+            timeoutMs: ACTION_TIMEOUT_MS,
+            gracefulMs: DEFAULT_GRACEFUL_TERMINATION_MS,
+            logger: console.error
+        });
+        if (result.error) console.error('[proxy-runner] 启动或运行子进程失败:', result.error.message);
         return {
-            code: childResult.code,
-            timedOut: childResult.timedOut,
+            code: result.code,
+            timedOut: result.timedOut,
             actionResult: readActionResult(resultFile)
         };
     } catch (error) {
         try { fs.unlinkSync(resultFile); } catch (cleanupError) { }
         return { code: EXIT_CODE.FATAL, timedOut: false, actionResult: null, error };
     }
-}
-
-// ============================================================
-//  finalizeWorkflow 和日志输出
-// ============================================================
-function finalizeWorkflow(finalCode, finalResult, attempts) {
-    const summary = buildFinalSummary(finalCode, finalResult, attempts);
-    console.log(`\n[proxy-runner] ===== 最终结果 =====`);
-    console.log(`[proxy-runner] 最终状态: ${summary.status}`);
-    console.log(`[proxy-runner] 详细信息: ${summary.message}`);
-    for (const item of attempts) {
-        const time = new Date().toISOString();
-        console.log(`[proxy-runner]   [${item.attempt}] proxy=${item.proxy} code=${item.code} status=${item.status} ${item.message || ''}`);
-    }
-    console.log('');
-    return finalCode;
 }
 
 // ============================================================
@@ -445,41 +518,8 @@ async function runProxyWorkflow(attempts) {
     let cooldowns = loadCooldowns();
     removeExpiredCooldowns(cooldowns);
 
-    // ===== 先尝试直连（无代理） =====
-    console.log(`\n[proxy-runner] ===== 尝试直连 =====`);
-    const directResult = await runActionRenew(null, 1);
-    const directAttempt = makeAttemptRecord(1, null, directResult);
-    attempts.push(directAttempt);
-
-    if (NON_RETRYABLE.has(directResult.code)) {
-        const normalizedCode = (directResult.code === EXIT_CODE.NOT_READY || directResult.code === EXIT_CODE.ALREADY_RENEWED) ? EXIT_CODE.SUCCESS : directResult.code;
-        if (directResult.code !== normalizedCode) {
-            console.log(`[proxy-runner] 业务状态码 ${directResult.code} 归一为 ${normalizedCode}（正常业务，非失败）`);
-        }
-        console.log(`[proxy-runner] 直连成功，退出码 ${normalizedCode}`);
-        return finalizeWorkflow(normalizedCode, directResult.actionResult || directAttempt, attempts);
-    }
-
-    if (directResult.code === EXIT_CODE.FATAL) {
-        console.log(`[proxy-runner] 直连 FATAL，非代理问题，停止`);
-        return finalizeWorkflow(EXIT_CODE.FATAL, directResult.actionResult || directAttempt, attempts);
-    }
-
-    // 直连返回 PROXY_RETRY → 降级到代理
-    console.log(`[proxy-runner] 直连失败 (PROXY_RETRY)，降级到代理...`);
-
-    // 如果没有可用代理，直接报错
-    if (proxies.length === 0) {
-        console.log('[proxy-runner] 直连失败，且无可用代理，停止');
-        return finalizeWorkflow(EXIT_CODE.NO_PROXY_AVAILABLE, {
-            status: 'no_proxy_available',
-            message: 'Direct connection failed and no proxies available',
-            accounts: []
-        }, attempts);
-    }
-
-    for (let attempt = 2; attempt <= CONFIG.MAX_PROXY_SWITCHES + 1; attempt++) {
-        console.log(`\n[proxy-runner] ===== 代理尝试 ${attempt - 1}/${CONFIG.MAX_PROXY_SWITCHES} =====`);
+    for (let attempt = 1; attempt <= CONFIG.MAX_PROXY_SWITCHES; attempt++) {
+        console.log(`\n[proxy-runner] ===== 代理尝试 ${attempt}/${CONFIG.MAX_PROXY_SWITCHES} =====`);
 
         // 1) 选代理
         let selection = null;
@@ -578,10 +618,6 @@ module.exports = {
     buildChildEnv,
     maskProxyUrl,
     emitGithubMask,
-    finalizeWorkflow,
-    makeAttemptRecord,
-    buildFinalSummary,
-    formatFinalNotification,
     loadProxies,
     selectRandomProxy,
     proxyKey,
