@@ -125,10 +125,15 @@ function formatFinalNotification(finalCode, finalResult, attempts) {
 //  冷却管理
 // ============================================================
 function proxyKey(parsed) {
-    return `${parsed.host}:${parsed.port}`;
+    const ip = parsed.ip || parsed.host || '';
+    return `${ip}:${parsed.port}`;
 }
 
 function safeProxyId(parsed) {
+    if (!parsed || !parsed.valid) return 'invalid';
+    if (parsed.ip) return `${parsed.ip}:${parsed.port}`;
+    if (parsed.host) return `${parsed.ip || parsed.host}:${parsed.port}`;
+    return 'unknown';
     if (!parsed) return 'direct';
     const host = parsed.host || '';
     const port = parsed.port || '';
@@ -230,7 +235,7 @@ function parseProxyLine(line, lineNumber) {
         return {
             valid: true,
             protocol: 'http',
-            host,
+            ip: host,
             port,
             username,
             password,
@@ -246,7 +251,7 @@ function parseProxyLine(line, lineNumber) {
         if (!isValidPort(port)) return { valid: false, reason: 'invalid_port', lineNumber };
         if (!username) return { valid: false, reason: 'missing_username', lineNumber };
         if (!password) return { valid: false, reason: 'missing_password', lineNumber };
-        return { valid: true, protocol: 'http', host, port, username, password, lineNumber };
+        return { valid: true, protocol: 'http', ip: host, port, username, password, lineNumber };
     }
 
     // Format 3: IP:PORT (no auth)
@@ -254,7 +259,7 @@ function parseProxyLine(line, lineNumber) {
         const [host, port] = parts;
         if (!isValidHost(host)) return { valid: false, reason: 'invalid_host', lineNumber };
         if (!isValidPort(port)) return { valid: false, reason: 'invalid_port', lineNumber };
-        return { valid: true, protocol: 'http', host, port, username: '', password: '', lineNumber };
+        return { valid: true, protocol: 'http', ip: host, port, username: '', password: '', lineNumber };
     }
 
     return { valid: false, reason: 'unsupported_format', lineNumber };
@@ -262,11 +267,15 @@ function parseProxyLine(line, lineNumber) {
 
 function buildHttpProxy(parsed) {
     if (!parsed || !parsed.valid) return null;
-    const { protocol, host, port, username, password } = parsed;
+    const ip = parsed.ip || parsed.host || '';
+    const port = parsed.port || '';
+    const protocol = parsed.protocol || 'http';
+    const { username, password } = parsed;
+    if (!ip || !port) return null;
     if (username && password) {
-        return `${protocol}://${encodeURIComponent(username)}:${encodeURIComponent(password)}@${host}:${port}`;
+        return `${protocol}://${encodeURIComponent(username)}:${encodeURIComponent(password)}@${ip}:${port}`;
     }
-    return `${protocol}://${host}:${port}`;
+    return `${protocol}://${ip}:${port}`;
 }
 
 function maskProxyUrl(url) {
